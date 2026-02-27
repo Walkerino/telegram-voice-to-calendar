@@ -1,0 +1,108 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum PipelineStatus {
+  received
+  transcribed
+  parsed
+  awaiting_confirmation
+  created
+  cancelled
+  failed
+}
+
+enum UserState {
+  idle
+  awaiting_edit
+}
+
+enum CalendarProvider {
+  icloud
+}
+
+enum ConnectionStatus {
+  disconnected
+  connected
+  invalid
+}
+
+model User {
+  id                    String               @id @default(cuid())
+  telegramUserId        String               @unique
+  telegramUsername      String?
+  firstName             String?
+  lastName              String?
+  timezone              String               @default("Europe/Warsaw")
+  languageCode          String?              @default("ru")
+  state                 UserState            @default(idle)
+  currentDraftMessageId String?
+  createdAt             DateTime             @default(now())
+  updatedAt             DateTime             @updatedAt
+
+  messages              Message[]
+  events                Event[]
+  calendarConnections   CalendarConnection[]
+}
+
+model Message {
+  id                String         @id @default(cuid())
+  userId            String
+  telegramChatId    String
+  telegramMessageId Int
+  telegramUpdateId  Int?
+  voiceFileId       String?
+  transcript        String?
+  draftJson         Json?
+  status            PipelineStatus @default(received)
+  lastError         String?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  user              User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  event             Event?
+
+  @@unique([telegramChatId, telegramMessageId])
+  @@index([userId, createdAt])
+}
+
+model Event {
+  id          String   @id @default(cuid())
+  userId      String
+  messageId   String   @unique
+  uid         String   @unique
+  title       String
+  description String?
+  location    String?
+  startAt     DateTime
+  endAt       DateTime
+  timezone    String
+  reminders   Json
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  message     Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([userId, startAt])
+}
+
+model CalendarConnection {
+  id                    String           @id @default(cuid())
+  userId                String
+  provider              CalendarProvider
+  appleId               String?
+  encryptedAppPassword  String?
+  status                ConnectionStatus @default(disconnected)
+  createdAt             DateTime         @default(now())
+  updatedAt             DateTime         @updatedAt
+
+  user                  User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, provider])
+}
