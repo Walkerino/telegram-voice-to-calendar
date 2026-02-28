@@ -1,6 +1,6 @@
 # Telegram Voice -> Calendar (MVP)
 
-MVP сервис на Next.js: пользователь отправляет voice в Telegram, бот распознаёт текст, парсит событие и после подтверждения добавляет событие в iCloud Calendar (CalDAV). Если iCloud не настроен или недоступен, бот отправляет `.ics`.
+MVP сервис на Next.js: пользователь отправляет voice в Telegram, бот распознаёт текст, парсит событие и после подтверждения добавляет событие в iCloud Calendar (CalDAV). Если iCloud недоступен, бот отправляет `.ics`.
 
 ## Что реализовано
 - Next.js App Router + TypeScript + Node runtime API route
@@ -9,17 +9,17 @@ MVP сервис на Next.js: пользователь отправляет voi
 - Voice pipeline: `received -> transcribed -> parsed -> awaiting_confirmation -> created/cancelled/failed`
 - Идемпотентность по `(telegramChatId, telegramMessageId)`
 - Абстракции:
-  - `ITranscriber` (`mock` + локальный `whisper.cpp` адаптер)
-  - `IEventParser` (`rules` + заглушка `llm`)
-- Rule-based parser (RU/EN):
+  - `ITranscriber` (`mock` + локальные `whisper.cpp`/`faster-whisper` адаптеры)
+  - `IEventParser` (`rules` + заглушка `llm`) для событий
+- Rule-based парсинг событий:
   - `сегодня`, `завтра`, `в пятницу`
   - `в 18:30`
   - `через 2 часа`
   - длительность (`на час`, `на 30 минут`, `for 2 hours`)
 - Confirmation flow в Telegram:
-  - `✅ Создать`
-  - `✏️ Изменить`
-  - `🗑 Отмена`
+  - `✅ Save / Create`
+  - `✏️ Edit`
+  - `🗑 Cancel`
 - Генерация `.ics` (VEVENT + VALARM) и отправка через `sendDocument`
 - Прямая синхронизация с iCloud Calendar через CalDAV (по env-настройкам)
 - Команды бота: `/help`, `/timezone`, `/reminder`, `/settings`, `/today`, `/upcoming`, `/new`, `/cancel`, `/connect_icloud`, `/disconnect_icloud`, `/feedback`
@@ -78,8 +78,10 @@ cp .env.example .env
 - `ICLOUD_APP_SPECIFIC_PASSWORD` (опционально, app-specific password Apple ID)
 - `ICLOUD_CALDAV_BASE_URL` (опционально, по умолчанию `https://caldav.icloud.com`)
 - `ICLOUD_CALENDAR_NAME` (опционально, имя календаря для записи; если не задано, берётся первый найденный)
-- `TRANSCRIBER=mock|whisper` (`mock` - бесплатный режим по умолчанию, `whisper` - локальный open-source STT)
+- `TRANSCRIBER=mock|whisper|faster-whisper` (`mock` - режим по умолчанию)
 - `EVENT_PARSER=rules|llm` (`llm` в MVP не реализован, автоматически используется `rules`)
+- `OLLAMA_ENABLED`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL` (резерв под 2 этап)
+- `TELEGRAM_RATE_LIMIT_PER_MINUTE` (anti-flood per user)
 
 Дополнительно:
 - `WHISPER_CPP_BIN` (по умолчанию `whisper-cli`)
@@ -91,7 +93,38 @@ cp .env.example .env
 - `WHISPER_NO_TIMESTAMPS`, `WHISPER_SUPPRESS_NON_SPEECH` (`1/0` флаги очистки вывода)
 - `WHISPER_AUDIO_FILTER` (опциональный `ffmpeg -af` фильтр перед распознаванием)
 - `WHISPER_VAD_MODEL_PATH`, `WHISPER_VAD_THRESHOLD` (опциональный VAD для «шумных» голосовых)
+- `FASTER_WHISPER_*` (параметры локального `faster-whisper`)
 - `MOCK_TRANSCRIPT_TEXT` (текст-заглушка в `mock` режиме)
+
+## Локальный STT (faster-whisper)
+
+Для `TRANSCRIBER=faster-whisper` нужны:
+- `ffmpeg`
+- Python 3.10+
+- `faster-whisper` в выбранном Python-окружении
+
+Пример установки:
+
+```bash
+python3 -m venv .tools/pyenv-faster
+. .tools/pyenv-faster/bin/activate
+python -m pip install --upgrade pip
+python -m pip install faster-whisper
+```
+
+Пример `.env`:
+
+```bash
+TRANSCRIBER=faster-whisper
+FASTER_WHISPER_PYTHON_BIN=/absolute/path/to/.tools/pyenv-faster/bin/python
+FASTER_WHISPER_MODEL=small
+FASTER_WHISPER_DEVICE=auto
+FASTER_WHISPER_COMPUTE_TYPE=int8
+FASTER_WHISPER_LANGUAGE=ru
+FASTER_WHISPER_BEAM_SIZE=5
+FASTER_WHISPER_BEST_OF=5
+FASTER_WHISPER_VAD_FILTER=1
+```
 
 ## Локальный STT (whisper.cpp)
 
@@ -100,7 +133,7 @@ cp .env.example .env
 - бинарник `whisper.cpp` (`whisper-cli` или путь в `WHISPER_CPP_BIN`)
 - модель whisper (например `ggml-base.bin`), путь в `WHISPER_MODEL_PATH`
 
-Для качества распознавания RU/EN лучше использовать модель не ниже `small` (если хватает CPU/GPU).
+Для качества распознавания RU/EN лучше использовать модель не ниже `small` (рекомендуемо `small` или `medium`).
 
 Пример установки в каталоге проекта:
 
@@ -171,20 +204,19 @@ cloudflared tunnel --url http://localhost:3000
 Затем аналогично вызовите `setWebhook` с публичным URL.
 
 ## Поток бота
-1. `/start` -> приветствие и подсказка.
+1. `/start` -> приветствие и таймзона.
 2. Пользователь шлёт voice.
 3. Бот скачивает `.ogg`, отправляет в transcriber.
 4. Parser строит `EventDraft`.
-5. Бот отправляет расшифровку + карточку + inline кнопки.
-6. `✅ Создать` -> создаётся запись Event в БД + попытка прямой записи в iCloud (CalDAV).
-7. Если iCloud не настроен/недоступен, бот отправляет `.ics` как fallback.
-8. `✏️ Изменить` -> бот ждёт правку одной строкой и повторно парсит.
-9. `🗑 Отмена` -> черновик переводится в `cancelled`.
+5. Бот отправляет карточку события + inline кнопки подтверждения.
+6. `✅ Save / Create` -> создаётся Event в БД + попытка sync в iCloud (или `.ics` fallback).
+7. `✏️ Edit` -> бот ждёт правку одной строкой и повторно парсит.
+8. `🗑 Cancel` -> черновик переводится в `cancelled`.
 
 ## Команды Telegram
 - `/start` - приветствие и краткая инструкция
 - `/help` - список всех команд
-- `/timezone Europe/Moscow` - изменить таймзону
+- `/timezone Europe/Warsaw` - изменить таймзону
 - `/reminder 10` или `/reminder off` - напоминание по умолчанию
 - `/settings` - показать текущие настройки
 - `/today` - события на сегодня
