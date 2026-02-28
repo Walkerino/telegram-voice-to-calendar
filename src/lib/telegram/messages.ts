@@ -6,15 +6,21 @@ export function renderDraftMessage(transcript: string, draft: EventDraft): strin
   const end = DateTime.fromISO(draft.end, { zone: "utc" }).setZone(draft.timezone);
   const reminders = draft.reminders.map((r) => `${r.minutesBefore} мин`).join(", ");
 
-  return [
-    "Распознанный текст:",
-    transcript,
-    "",
-    "Черновик события:",
+  const lines = [
+    // "Распознанный текст:",
+    // transcript,
+    // "",
     `Название: ${draft.title}`,
-    `Начало: ${start.toFormat("dd.LL.yyyy HH:mm")}`,
-    `Конец: ${end.toFormat("dd.LL.yyyy HH:mm")}`,
-    `Таймзона: ${draft.timezone}`,
-    `Напоминание: ${reminders}`
-  ].join("\n");
+    "",
+    `🕐 Начало: ${start.toFormat("dd.LL.yyyy HH:mm")}`,
+    `🕐 Конец: ${end.toFormat("dd.LL.yyyy HH:mm")}`,
+    "",
+    `🌍 Таймзона: ${draft.timezone}`
+  ];
+
+  if (reminders) {
+    lines.push(`⏰ Напоминание: ${reminders}`);
+  }
+
+  return lines.join("\n");
 }

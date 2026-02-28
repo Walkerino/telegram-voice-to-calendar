@@ -1,10 +1,12 @@
-import { PipelineStatus, Prisma, UserState } from "@prisma/client";
+import { CalendarProvider, ConnectionStatus, PipelineStatus, Prisma, UserState } from "@prisma/client";
 import type { Bot, Context } from "grammy";
 import { InputFile } from "grammy";
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { DateTime } from "luxon";
 import { env, requireEnv } from "@/lib/config/env";
 import { prisma } from "@/lib/db/prisma";
 import { createICloudEventFromDraft } from "@/lib/calendar/icloud";
+import type { ICloudCredentials } from "@/lib/calendar/icloud";
 import { getEventParser } from "@/lib/parser";
 import { buildIcs, buildIcsFilename } from "@/lib/services/ics";
 import { parseAction, buildDraftKeyboard } from "@/lib/telegram/keyboards";
@@ -13,24 +15,35 @@ import { getTranscriber } from "@/lib/transcriber";
 import type { EventDraft } from "@/lib/types/event";
 
 const BOT_TOKEN = () => requireEnv("TELEGRAM_BOT_TOKEN");
+const DEFAULT_TIMEZONE = "Europe/Moscow";
+const DEFAULT_REMINDER_MINUTES = 30;
+const UPCOMING_LIMIT = 10;
+const PERSONAL_ICAL_PROVIDER = CalendarProvider.icloud;
+const ENCRYPTION_ALGORITHM = "aes-256-gcm";
 
 export function registerHandlers(bot: Bot<Context>): void {
   bot.command("start", async (ctx) => {
     const user = await ensureUser(ctx);
     await ctx.reply(
       [
-        "Отправьте голосовое сообщение с задачей.",
-        "Пример: Встреча завтра в 18:30 на час",
+        "Привет! Я превращаю голосовые в события календаря.",
+        "Пример: Встреча завтра в 18:30 на час.",
         `Текущая таймзона: ${user.timezone}`,
-        "Команда смены таймзоны: /timezone Europe/Warsaw"
+        `Напоминание по умолчанию: ${formatReminderValue(user.defaultReminderMinutes)}`,
+        "Полный список команд: /help"
       ].join("\n")
     );
+  });
+
+  bot.command("help", async (ctx) => {
+    await ensureUser(ctx);
+    await ctx.reply(buildHelpMessage());
   });
 
   bot.command("timezone", async (ctx) => {
     const user = await ensureUser(ctx);
     const text = ctx.message?.text ?? "";
-    const nextTimezone = text.replace(/^\/timezone\s*/i, "").trim();
+    const nextTimezone = extractCommandArg(text, "timezone");
 
     if (!nextTimezone) {
       await ctx.reply(`Текущая таймзона: ${user.timezone}`);
@@ -39,7 +52,7 @@ export function registerHandlers(bot: Bot<Context>): void {
 
     const check = DateTime.now().setZone(nextTimezone);
     if (!check.isValid) {
-      await ctx.reply("Некорректная таймзона. Пример: Europe/Warsaw");
+      await ctx.reply("Некорректная таймзона. Пример: Europe/Moscow");
       return;
     }
 
@@ -49,6 +62,176 @@ export function registerHandlers(bot: Bot<Context>): void {
     });
 
     await ctx.reply(`Таймзона обновлена: ${nextTimezone}`);
+  });
+
+  bot.command("reminder", async (ctx) => {
+    const user = await ensureUser(ctx);
+    const text = ctx.message?.text ?? "";
+    const rawArg = extractCommandArg(text, "reminder");
+
+    if (!rawArg) {
+      await ctx.reply(`Текущее напоминание по умолчанию: ${formatReminderValue(user.defaultReminderMinutes)}`);
+      return;
+    }
+
+    const parsed = parseReminderArg(rawArg);
+    if (!parsed.ok) {
+      await ctx.reply("Формат: /reminder 10 или /reminder off");
+      return;
+    }
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { defaultReminderMinutes: parsed.value }
+    });
+
+    await ctx.reply(`Напоминание по умолчанию обновлено: ${formatReminderValue(parsed.value)}`);
+  });
+
+  bot.command("settings", async (ctx) => {
+    const user = await ensureUser(ctx);
+    const connection = await prisma.calendarConnection.findUnique({
+      where: {
+        userId_provider: {
+          userId: user.id,
+          provider: PERSONAL_ICAL_PROVIDER
+        }
+      }
+    });
+
+    const globalICloudEnabled = Boolean(env.ICLOUD_APPLE_ID && env.ICLOUD_APP_SPECIFIC_PASSWORD);
+    const connectionLabel = formatICloudConnectionStatus(connection?.status, globalICloudEnabled);
+
+    await ctx.reply(
+      [
+        `Таймзона: ${user.timezone}`,
+        `Напоминание по умолчанию: ${formatReminderValue(user.defaultReminderMinutes)}`,
+        `iCloud: ${connectionLabel}`
+      ].join("\n")
+    );
+  });
+
+  bot.command("cancel", async (ctx) => {
+    const user = await ensureUser(ctx);
+    const cancelled = await cancelActiveDraftForUser(user.id);
+    await ctx.reply(cancelled ? "Текущий черновик отменен." : "Активного черновика нет.");
+  });
+
+  bot.command("new", async (ctx) => {
+    const user = await ensureUser(ctx);
+    await cancelActiveDraftForUser(user.id);
+    await ctx.reply("Ок, начинаем новый сценарий. Отправьте голосовое сообщение.");
+  });
+
+  bot.command("today", async (ctx) => {
+    const user = await ensureUser(ctx);
+    const now = DateTime.now().setZone(user.timezone);
+    const start = now.startOf("day");
+    const end = start.plus({ days: 1 });
+    const events = await listEvents(user.id, start, end, 20);
+    await ctx.reply(renderEventsList("События на сегодня", events, user.timezone));
+  });
+
+  bot.command("upcoming", async (ctx) => {
+    const user = await ensureUser(ctx);
+    const now = DateTime.now().setZone(user.timezone);
+    const events = await listEvents(user.id, now, null, UPCOMING_LIMIT);
+    await ctx.reply(renderEventsList(`Ближайшие ${UPCOMING_LIMIT} событий`, events, user.timezone));
+  });
+
+  bot.command("connect_icloud", async (ctx) => {
+    const user = await ensureUser(ctx);
+    const text = ctx.message?.text ?? "";
+    const rawArg = extractCommandArg(text, "connect_icloud");
+    const usage = "Формат: /connect_icloud your_apple_id@example.com xxxx-xxxx-xxxx-xxxx";
+
+    if (!rawArg) {
+      await ctx.reply(`${usage}\nПароль: app-specific password из Apple ID.`);
+      return;
+    }
+
+    if (!env.ENCRYPTION_KEY.trim()) {
+      await ctx.reply("Невозможно сохранить ключи: задайте ENCRYPTION_KEY в .env и перезапустите бота.");
+      return;
+    }
+
+    const [appleIdRaw, appPasswordRaw] = rawArg.split(/\s+/u);
+    const appleId = (appleIdRaw ?? "").trim();
+    const appPassword = (appPasswordRaw ?? "").trim();
+
+    if (!appleId || !appPassword || !appleId.includes("@")) {
+      await ctx.reply(usage);
+      return;
+    }
+
+    const encryptedAppPassword = encryptSecret(appPassword, env.ENCRYPTION_KEY);
+
+    await prisma.calendarConnection.upsert({
+      where: {
+        userId_provider: {
+          userId: user.id,
+          provider: PERSONAL_ICAL_PROVIDER
+        }
+      },
+      create: {
+        userId: user.id,
+        provider: PERSONAL_ICAL_PROVIDER,
+        appleId,
+        encryptedAppPassword,
+        status: ConnectionStatus.connected
+      },
+      update: {
+        appleId,
+        encryptedAppPassword,
+        status: ConnectionStatus.connected
+      }
+    });
+
+    await ctx.reply("Персональное подключение iCloud сохранено.");
+  });
+
+  bot.command("disconnect_icloud", async (ctx) => {
+    const user = await ensureUser(ctx);
+
+    await prisma.calendarConnection.upsert({
+      where: {
+        userId_provider: {
+          userId: user.id,
+          provider: PERSONAL_ICAL_PROVIDER
+        }
+      },
+      create: {
+        userId: user.id,
+        provider: PERSONAL_ICAL_PROVIDER,
+        status: ConnectionStatus.disconnected
+      },
+      update: {
+        appleId: null,
+        encryptedAppPassword: null,
+        status: ConnectionStatus.disconnected
+      }
+    });
+
+    await ctx.reply("Персональное подключение iCloud отключено.");
+  });
+
+  bot.command("feedback", async (ctx) => {
+    const user = await ensureUser(ctx);
+    const text = ctx.message?.text ?? "";
+    const feedback = extractCommandArg(text, "feedback");
+
+    if (!feedback) {
+      await ctx.reply("Напишите отзыв так: /feedback текст вашего сообщения");
+      return;
+    }
+
+    console.info("telegram feedback", {
+      userId: user.id,
+      telegramUserId: user.telegramUserId,
+      feedback: feedback.slice(0, 1000)
+    });
+
+    await ctx.reply("Спасибо! Отзыв сохранен.");
   });
 
   bot.on("message:voice", async (ctx) => {
@@ -143,15 +326,17 @@ export function registerHandlers(bot: Bot<Context>): void {
         return;
       }
 
+      const draft = applyReminderPreference(parseResult.draft, user.defaultReminderMinutes);
+
       await prisma.message.update({
         where: { id: dbMessage.id },
         data: {
           status: PipelineStatus.awaiting_confirmation,
-          draftJson: toJsonDraft(parseResult.draft)
+          draftJson: toJsonDraft(draft)
         }
       });
 
-      await ctx.reply(renderDraftMessage(transcript, parseResult.draft), {
+      await ctx.reply(renderDraftMessage(transcript, draft), {
         reply_markup: buildDraftKeyboard(dbMessage.id)
       });
     } catch (error) {
@@ -232,6 +417,11 @@ export function registerHandlers(bot: Bot<Context>): void {
       await ctx.answerCallbackQuery({ text: "Событие уже создано" });
       return;
     }
+    if (message.status === PipelineStatus.cancelled) {
+      await ctx.answerCallbackQuery({ text: "Черновик был отменен" });
+      await safeRemoveInlineKeyboard(ctx);
+      return;
+    }
 
     if (!message.draftJson) {
       await ctx.answerCallbackQuery({ text: "Нет данных события" });
@@ -289,21 +479,18 @@ export function registerHandlers(bot: Bot<Context>): void {
       }
     }
 
-    const hasICloudConfig = Boolean(env.ICLOUD_APPLE_ID && env.ICLOUD_APP_SPECIFIC_PASSWORD);
+    const iCloudConfig = await resolveICloudConfig(user.id);
+    const hasICloudConfig = Boolean(iCloudConfig);
     let syncedToICloud = false;
     let iCloudSyncError: string | null = null;
 
-    if (hasICloudConfig) {
+    if (iCloudConfig) {
       try {
         await createICloudEventFromDraft({
           uid,
           draft,
           calendarName: env.ICLOUD_CALENDAR_NAME || undefined,
-          credentials: {
-            appleId: env.ICLOUD_APPLE_ID,
-            appSpecificPassword: env.ICLOUD_APP_SPECIFIC_PASSWORD,
-            baseUrl: env.ICLOUD_CALDAV_BASE_URL
-          }
+          credentials: iCloudConfig.credentials
         });
         syncedToICloud = true;
       } catch (error) {
@@ -317,8 +504,14 @@ export function registerHandlers(bot: Bot<Context>): void {
 
     if (syncedToICloud) {
       await ctx.answerCallbackQuery({ text: "Событие добавлено в iCloud" });
-      await safeRemoveInlineKeyboard(ctx);
-      await ctx.reply("Событие создано и автоматически добавлено в iCloud Calendar.");
+      const updated = await safeEditDraftMessage(
+        ctx,
+        `${renderDraftMessage(message.transcript ?? "", draft)}\n\n✅ Событие создано и автоматически добавлено в iCloud Calendar.`
+      );
+      if (!updated) {
+        await safeRemoveInlineKeyboard(ctx);
+        await ctx.reply("Событие создано и автоматически добавлено в iCloud Calendar.");
+      }
       return;
     }
 
@@ -331,7 +524,7 @@ export function registerHandlers(bot: Bot<Context>): void {
       {
         caption: hasICloudConfig
           ? "Событие создано. Не удалось добавить в iCloud автоматически, отправляю .ics как запасной вариант."
-          : "Событие создано. Подключите iCloud в .env, чтобы добавлять автоматически."
+          : "Событие создано. Подключите iCloud через /connect_icloud или .env, чтобы добавлять автоматически."
       }
     );
 
@@ -399,12 +592,14 @@ export function registerHandlers(bot: Bot<Context>): void {
       return;
     }
 
+    const draft = applyReminderPreference(parseResult.draft, user.defaultReminderMinutes);
+
     await prisma.$transaction([
       prisma.message.update({
         where: { id: message.id },
         data: {
           transcript: mergedText,
-          draftJson: toJsonDraft(parseResult.draft),
+          draftJson: toJsonDraft(draft),
           status: PipelineStatus.awaiting_confirmation
         }
       }),
@@ -417,7 +612,7 @@ export function registerHandlers(bot: Bot<Context>): void {
       })
     ]);
 
-    await ctx.reply(renderDraftMessage(mergedText, parseResult.draft), {
+    await ctx.reply(renderDraftMessage(mergedText, draft), {
       reply_markup: buildDraftKeyboard(message.id)
     });
   });
@@ -438,7 +633,8 @@ async function ensureUser(ctx: Context) {
       firstName: ctx.from.first_name,
       lastName: ctx.from.last_name,
       languageCode: ctx.from.language_code,
-      timezone: "Europe/Warsaw"
+      timezone: DEFAULT_TIMEZONE,
+      defaultReminderMinutes: DEFAULT_REMINDER_MINUTES
     },
     update: {
       telegramUsername: ctx.from.username,
@@ -481,6 +677,21 @@ async function safeRemoveInlineKeyboard(ctx: Context): Promise<void> {
   }
 }
 
+async function safeEditDraftMessage(ctx: Context, text: string): Promise<boolean> {
+  try {
+    if (!ctx.callbackQuery?.message) {
+      return false;
+    }
+
+    await ctx.api.editMessageText(ctx.callbackQuery.message.chat.id, ctx.callbackQuery.message.message_id, text, {
+      reply_markup: undefined
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function toJsonDraft(draft: EventDraft): Prisma.InputJsonValue {
   return {
     title: draft.title,
@@ -497,4 +708,271 @@ function toJsonDraft(draft: EventDraft): Prisma.InputJsonValue {
 
 function toJsonReminders(reminders: EventDraft["reminders"]): Prisma.InputJsonValue {
   return reminders.map((r) => ({ minutesBefore: r.minutesBefore }));
+}
+
+function buildHelpMessage(): string {
+  return [
+    "Команды:",
+    "/start - старт и краткая инструкция",
+    "/help - список всех команд",
+    "/timezone [Zone] - показать или изменить таймзону",
+    "/reminder [минуты|off] - напоминание по умолчанию",
+    "/settings - текущие настройки",
+    "/today - события на сегодня",
+    "/upcoming - ближайшие события",
+    "/new - начать новый сценарий",
+    "/cancel - отменить активный черновик",
+    "/connect_icloud <apple_id> <app_password> - персональный iCloud",
+    "/disconnect_icloud - отключить персональный iCloud",
+    "/feedback <текст> - отправить отзыв"
+  ].join("\n");
+}
+
+function extractCommandArg(text: string, command: string): string {
+  const pattern = new RegExp(`^\\/${command}(?:@\\w+)?\\s*`, "iu");
+  return text.replace(pattern, "").trim();
+}
+
+function formatReminderValue(minutes: number | null): string {
+  if (!minutes || minutes <= 0) {
+    return "выключено";
+  }
+  return formatReminderBeforeStart(minutes);
+}
+
+function formatReminderBeforeStart(minutes: number): string {
+  const total = Math.max(0, Math.trunc(Math.abs(minutes)));
+  const hours = Math.floor(total / 60);
+  const restMinutes = total % 60;
+  const parts: string[] = [];
+
+  if (hours > 0) {
+    parts.push(`${hours} ${pluralizeRu(hours, "час", "часа", "часов")}`);
+  }
+  if (restMinutes > 0 || parts.length === 0) {
+    parts.push(`${restMinutes} ${pluralizeRu(restMinutes, "минуту", "минуты", "минут")}`);
+  }
+
+  return `за ${parts.join(" ")} до начала`;
+}
+
+function pluralizeRu(value: number, one: string, few: string, many: string): string {
+  const mod100 = value % 100;
+  const mod10 = value % 10;
+
+  if (mod100 >= 11 && mod100 <= 14) {
+    return many;
+  }
+  if (mod10 === 1) {
+    return one;
+  }
+  if (mod10 >= 2 && mod10 <= 4) {
+    return few;
+  }
+  return many;
+}
+
+function parseReminderArg(raw: string): { ok: true; value: number | null } | { ok: false } {
+  const normalized = raw.trim().toLowerCase();
+  if (!normalized) {
+    return { ok: false };
+  }
+  if (["off", "none", "no", "нет", "0"].includes(normalized)) {
+    return { ok: true, value: null };
+  }
+
+  const value = Number(normalized);
+  if (!Number.isInteger(value) || value < 1 || value > 1440) {
+    return { ok: false };
+  }
+  return { ok: true, value };
+}
+
+function applyReminderPreference(draft: EventDraft, defaultReminderMinutes: number | null): EventDraft {
+  if (!defaultReminderMinutes || defaultReminderMinutes <= 0) {
+    return { ...draft, reminders: [] };
+  }
+
+  return {
+    ...draft,
+    reminders: [{ minutesBefore: defaultReminderMinutes }]
+  };
+}
+
+function formatICloudConnectionStatus(
+  status: ConnectionStatus | undefined,
+  globalICloudEnabled: boolean
+): string {
+  if (status === ConnectionStatus.connected) {
+    return "подключен (персонально)";
+  }
+  if (status === ConnectionStatus.invalid) {
+    return globalICloudEnabled ? "ошибка персонального подключения, fallback: .env" : "ошибка подключения";
+  }
+  return globalICloudEnabled ? "подключен через .env" : "не подключен";
+}
+
+async function cancelActiveDraftForUser(userId: string): Promise<boolean> {
+  let cancelled = false;
+
+  const active = await prisma.message.findFirst({
+    where: {
+      userId,
+      status: {
+        in: [PipelineStatus.parsed, PipelineStatus.awaiting_confirmation, PipelineStatus.transcribed]
+      }
+    },
+    orderBy: { createdAt: "desc" }
+  });
+
+  const tx: Prisma.PrismaPromise<unknown>[] = [
+    prisma.user.update({
+      where: { id: userId },
+      data: {
+        state: UserState.idle,
+        currentDraftMessageId: null
+      }
+    })
+  ];
+
+  if (active) {
+    cancelled = true;
+    tx.push(
+      prisma.message.update({
+        where: { id: active.id },
+        data: { status: PipelineStatus.cancelled }
+      })
+    );
+  }
+
+  await prisma.$transaction(tx);
+  return cancelled;
+}
+
+async function listEvents(
+  userId: string,
+  fromLocal: DateTime,
+  toLocal: DateTime | null,
+  limit: number
+) {
+  const where: Prisma.EventWhereInput = {
+    userId,
+    startAt: {
+      gte: toDate(fromLocal.toUTC()),
+      ...(toLocal ? { lt: toDate(toLocal.toUTC()) } : {})
+    }
+  };
+
+  return prisma.event.findMany({
+    where,
+    orderBy: { startAt: "asc" },
+    take: limit
+  });
+}
+
+function renderEventsList(
+  title: string,
+  events: Array<{ title: string; startAt: Date; endAt: Date; timezone: string }>,
+  userTimezone: string
+): string {
+  if (events.length === 0) {
+    return `${title}: пока пусто.`;
+  }
+
+  const lines = [title + ":"];
+  for (const event of events) {
+    const start = DateTime.fromJSDate(event.startAt, { zone: "utc" }).setZone(userTimezone);
+    const end = DateTime.fromJSDate(event.endAt, { zone: "utc" }).setZone(userTimezone);
+    lines.push(`• ${start.toFormat("dd.LL HH:mm")} - ${end.toFormat("HH:mm")} ${event.title}`);
+  }
+  return lines.join("\n");
+}
+
+async function resolveICloudConfig(
+  userId: string
+): Promise<{ credentials: ICloudCredentials; source: "user" | "env" } | null> {
+  const connection = await prisma.calendarConnection.findUnique({
+    where: {
+      userId_provider: {
+        userId,
+        provider: PERSONAL_ICAL_PROVIDER
+      }
+    }
+  });
+
+  if (
+    connection?.status === ConnectionStatus.connected &&
+    connection.appleId &&
+    connection.encryptedAppPassword &&
+    env.ENCRYPTION_KEY.trim()
+  ) {
+    try {
+      const password = decryptSecret(connection.encryptedAppPassword, env.ENCRYPTION_KEY);
+      return {
+        source: "user",
+        credentials: {
+          appleId: connection.appleId,
+          appSpecificPassword: password,
+          baseUrl: env.ICLOUD_CALDAV_BASE_URL
+        }
+      };
+    } catch (error) {
+      console.error("icloud credentials decrypt failed", {
+        userId,
+        reason: toSafeError(error)
+      });
+      await prisma.calendarConnection.update({
+        where: { id: connection.id },
+        data: { status: ConnectionStatus.invalid }
+      });
+    }
+  }
+
+  if (env.ICLOUD_APPLE_ID && env.ICLOUD_APP_SPECIFIC_PASSWORD) {
+    return {
+      source: "env",
+      credentials: {
+        appleId: env.ICLOUD_APPLE_ID,
+        appSpecificPassword: env.ICLOUD_APP_SPECIFIC_PASSWORD,
+        baseUrl: env.ICLOUD_CALDAV_BASE_URL
+      }
+    };
+  }
+
+  return null;
+}
+
+function encryptSecret(value: string, passphrase: string): string {
+  const key = createHash("sha256").update(passphrase, "utf-8").digest();
+  const iv = randomBytes(12);
+  const cipher = createCipheriv(ENCRYPTION_ALGORITHM, key, iv);
+  const encrypted = Buffer.concat([cipher.update(value, "utf-8"), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+
+  return [iv.toString("base64"), authTag.toString("base64"), encrypted.toString("base64")].join(":");
+}
+
+function decryptSecret(payload: string, passphrase: string): string {
+  const [ivBase64, tagBase64, encryptedBase64] = payload.split(":");
+  if (!ivBase64 || !tagBase64 || !encryptedBase64) {
+    throw new Error("Invalid encrypted payload format");
+  }
+
+  const key = createHash("sha256").update(passphrase, "utf-8").digest();
+  const decipher = createDecipheriv(ENCRYPTION_ALGORITHM, key, Buffer.from(ivBase64, "base64"));
+  decipher.setAuthTag(Buffer.from(tagBase64, "base64"));
+
+  const decrypted = Buffer.concat([
+    decipher.update(Buffer.from(encryptedBase64, "base64")),
+    decipher.final()
+  ]);
+  return decrypted.toString("utf-8");
+}
+
+function toDate(value: DateTime): Date {
+  const iso = value.toISO();
+  if (!iso) {
+    throw new Error("Invalid datetime");
+  }
+  return new Date(iso);
 }
