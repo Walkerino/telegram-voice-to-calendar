@@ -11,6 +11,12 @@ export function getTranscriber(): ITranscriber {
   }
 
   if (env.TRANSCRIBER === "whisper") {
+    if (!env.WHISPER_MODEL_PATH) {
+      console.warn("TRANSCRIBER=whisper selected but WHISPER_MODEL_PATH is missing. Falling back to mock.");
+      transcriberSingleton = new MockTranscriber();
+      return transcriberSingleton;
+    }
+
     transcriberSingleton = new WhisperTranscriber();
     return transcriberSingleton;
   }
