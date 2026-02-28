@@ -27,7 +27,7 @@ export class WhisperTranscriber implements ITranscriber {
       await convertToWav(sourceFile, wavFile);
       await runWhisperCpp(wavFile, outputBase);
 
-      const transcript = (await readFile(outputTxt, "utf-8")).trim();
+      const transcript = normalizeTranscript(await readFile(outputTxt, "utf-8"));
       if (!transcript) {
         throw new Error("Local whisper returned empty transcription");
       }
@@ -43,15 +43,18 @@ export class WhisperTranscriber implements ITranscriber {
 }
 
 async function convertToWav(sourceFile: string, wavFile: string): Promise<void> {
+  const args = ["-y", "-i", sourceFile, "-vn", "-sn", "-dn", "-ar", "16000", "-ac", "1"];
+  const audioFilter = env.WHISPER_AUDIO_FILTER.trim();
+  if (audioFilter) {
+    args.push("-af", audioFilter);
+  }
+  args.push("-c:a", "pcm_s16le", wavFile);
+
   try {
-    await execFileAsync(
-      FFMPEG_BIN,
-      ["-y", "-i", sourceFile, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wavFile],
-      {
-        timeout: TRANSCRIBE_TIMEOUT_MS,
-        maxBuffer: 10 * 1024 * 1024
-      }
-    );
+    await execFileAsync(FFMPEG_BIN, args, {
+      timeout: TRANSCRIBE_TIMEOUT_MS,
+      maxBuffer: 10 * 1024 * 1024
+    });
   } catch (error) {
     throw toCommandError(error, "ffmpeg conversion failed");
   }
@@ -64,9 +67,42 @@ async function runWhisperCpp(wavFile: string, outputBase: string): Promise<void>
     args.push("-l", language);
   }
 
+  if (isEnabled(env.WHISPER_NO_TIMESTAMPS, true)) {
+    args.push("-nt");
+  }
+
+  if (isEnabled(env.WHISPER_SUPPRESS_NON_SPEECH, true)) {
+    args.push("-sns");
+  }
+
+  const prompt = env.WHISPER_INITIAL_PROMPT.trim();
+  if (prompt) {
+    args.push("--prompt", prompt, "--carry-initial-prompt");
+  }
+
+  const bestOf = parsePositiveInt(env.WHISPER_BEST_OF);
+  if (bestOf !== null) {
+    args.push("-bo", String(bestOf));
+  }
+
+  const beamSize = parsePositiveInt(env.WHISPER_BEAM_SIZE);
+  if (beamSize !== null) {
+    args.push("-bs", String(beamSize));
+  }
+
   const threads = Number(env.WHISPER_THREADS);
   if (Number.isFinite(threads) && threads > 0) {
     args.push("-t", String(Math.trunc(threads)));
+  }
+
+  const vadModelPath = env.WHISPER_VAD_MODEL_PATH.trim();
+  if (vadModelPath) {
+    args.push("--vad", "-vm", vadModelPath);
+
+    const vadThreshold = parsePositiveFloat(env.WHISPER_VAD_THRESHOLD);
+    if (vadThreshold !== null) {
+      args.push("-vt", String(vadThreshold));
+    }
   }
 
   try {
@@ -88,4 +124,40 @@ function toCommandError(error: unknown, prefix: string): Error {
     return new Error(`${prefix}: ${error.message}`);
   }
   return new Error(prefix);
+}
+
+function normalizeTranscript(raw: string): string {
+  return raw
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\[(?:BLANK_AUDIO|MUSIC|APPLAUSE|LAUGHTER)\]/giu, " ")
+    .replace(/\s+([,.;:!?])/gu, "$1")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+function parsePositiveInt(value: string): number | null {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return null;
+  }
+  return Math.trunc(parsed);
+}
+
+function parsePositiveFloat(value: string): number | null {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return null;
+  }
+  return parsed;
+}
+
+function isEnabled(value: string, defaultValue: boolean): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) {
+    return defaultValue;
+  }
+  return ["1", "true", "yes", "on"].includes(normalized);
 }

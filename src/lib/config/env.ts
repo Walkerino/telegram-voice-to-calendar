@@ -12,7 +12,15 @@ export const env = {
   WHISPER_CPP_BIN: process.env.WHISPER_CPP_BIN ?? "whisper-cli",
   WHISPER_MODEL_PATH: process.env.WHISPER_MODEL_PATH ?? "",
   WHISPER_LANGUAGE: process.env.WHISPER_LANGUAGE ?? "auto",
-  WHISPER_THREADS: process.env.WHISPER_THREADS ?? ""
+  WHISPER_THREADS: process.env.WHISPER_THREADS ?? "",
+  WHISPER_INITIAL_PROMPT: process.env.WHISPER_INITIAL_PROMPT ?? "",
+  WHISPER_BEAM_SIZE: process.env.WHISPER_BEAM_SIZE ?? "",
+  WHISPER_BEST_OF: process.env.WHISPER_BEST_OF ?? "",
+  WHISPER_NO_TIMESTAMPS: process.env.WHISPER_NO_TIMESTAMPS ?? "1",
+  WHISPER_SUPPRESS_NON_SPEECH: process.env.WHISPER_SUPPRESS_NON_SPEECH ?? "1",
+  WHISPER_AUDIO_FILTER: process.env.WHISPER_AUDIO_FILTER ?? "",
+  WHISPER_VAD_MODEL_PATH: process.env.WHISPER_VAD_MODEL_PATH ?? "",
+  WHISPER_VAD_THRESHOLD: process.env.WHISPER_VAD_THRESHOLD ?? ""
 };
 
 export function requireEnv(name: keyof typeof env): string {
