@@ -22,7 +22,7 @@ MVP сервис на Next.js: пользователь отправляет voi
   - `🗑 Отмена`
 - Генерация `.ics` (VEVENT + VALARM) и отправка через `sendDocument`
 - Прямая синхронизация с iCloud Calendar через CalDAV (по env-настройкам)
-- Команда смены таймзоны: `/timezone Europe/Warsaw`
+- Команды бота: `/help`, `/timezone`, `/reminder`, `/settings`, `/today`, `/upcoming`, `/new`, `/cancel`, `/connect_icloud`, `/disconnect_icloud`, `/feedback`
 
 ## Структура
 
@@ -73,7 +73,7 @@ cp .env.example .env
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_WEBHOOK_SECRET` (если используете secret token в webhook)
 - `DATABASE_URL` (для локального SQLite: `file:./dev.db`)
-- `ENCRYPTION_KEY` (зарезервировано под этап iCloud)
+- `ENCRYPTION_KEY` (используется для шифрования пароля в `/connect_icloud`)
 - `ICLOUD_APPLE_ID` (опционально, для прямой записи в iCloud)
 - `ICLOUD_APP_SPECIFIC_PASSWORD` (опционально, app-specific password Apple ID)
 - `ICLOUD_CALDAV_BASE_URL` (опционально, по умолчанию `https://caldav.icloud.com`)
@@ -86,6 +86,11 @@ cp .env.example .env
 - `WHISPER_MODEL_PATH` (обязателен для `TRANSCRIBER=whisper`)
 - `WHISPER_LANGUAGE` (по умолчанию `auto`)
 - `WHISPER_THREADS` (по умолчанию можно оставить `4`)
+- `WHISPER_INITIAL_PROMPT` (контекст для повышения точности в вашей предметной области)
+- `WHISPER_BEST_OF`, `WHISPER_BEAM_SIZE` (параметры декодера: выше качество, но медленнее)
+- `WHISPER_NO_TIMESTAMPS`, `WHISPER_SUPPRESS_NON_SPEECH` (`1/0` флаги очистки вывода)
+- `WHISPER_AUDIO_FILTER` (опциональный `ffmpeg -af` фильтр перед распознаванием)
+- `WHISPER_VAD_MODEL_PATH`, `WHISPER_VAD_THRESHOLD` (опциональный VAD для «шумных» голосовых)
 - `MOCK_TRANSCRIPT_TEXT` (текст-заглушка в `mock` режиме)
 
 ## Локальный STT (whisper.cpp)
@@ -94,6 +99,8 @@ cp .env.example .env
 - `ffmpeg`
 - бинарник `whisper.cpp` (`whisper-cli` или путь в `WHISPER_CPP_BIN`)
 - модель whisper (например `ggml-base.bin`), путь в `WHISPER_MODEL_PATH`
+
+Для качества распознавания RU/EN лучше использовать модель не ниже `small` (если хватает CPU/GPU).
 
 Пример установки в каталоге проекта:
 
@@ -114,6 +121,12 @@ WHISPER_CPP_BIN=whisper-cli
 WHISPER_MODEL_PATH=/absolute/path/to/ggml-base.bin
 WHISPER_LANGUAGE=ru
 WHISPER_THREADS=4
+WHISPER_INITIAL_PROMPT=Это голосовое сообщение для календаря. Распознавай даты, время и длительность точно.
+WHISPER_BEST_OF=5
+WHISPER_BEAM_SIZE=5
+WHISPER_NO_TIMESTAMPS=1
+WHISPER_SUPPRESS_NON_SPEECH=1
+WHISPER_AUDIO_FILTER=highpass=f=80,lowpass=f=7600
 ```
 
 ## Локальный запуск
@@ -168,6 +181,20 @@ cloudflared tunnel --url http://localhost:3000
 8. `✏️ Изменить` -> бот ждёт правку одной строкой и повторно парсит.
 9. `🗑 Отмена` -> черновик переводится в `cancelled`.
 
+## Команды Telegram
+- `/start` - приветствие и краткая инструкция
+- `/help` - список всех команд
+- `/timezone Europe/Moscow` - изменить таймзону
+- `/reminder 10` или `/reminder off` - напоминание по умолчанию
+- `/settings` - показать текущие настройки
+- `/today` - события на сегодня
+- `/upcoming` - ближайшие события
+- `/new` - начать новый сценарий
+- `/cancel` - отменить активный черновик
+- `/connect_icloud your_apple_id@example.com xxxx-xxxx-xxxx-xxxx` - сохранить персональный iCloud
+- `/disconnect_icloud` - отключить персональный iCloud
+- `/feedback текст` - отправить отзыв
+
 ## Настройка прямой записи в iCloud
 1. На Apple ID включите 2FA (если ещё не включено).
 2. Создайте app-specific password: `appleid.apple.com` -> Sign-In and Security -> App-Specific Passwords.
@@ -182,7 +209,3 @@ ICLOUD_CALENDAR_NAME="Calendar"
 ```
 
 После перезапуска сервиса бот начнёт добавлять события напрямую в iCloud.
-
-## Stage 2 (дизайн)
-- `/connect_icloud` через Telegram
-- хранение app-specific password в зашифрованном виде в БД
