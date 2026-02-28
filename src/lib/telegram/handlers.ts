@@ -1,21 +1,29 @@
-import { CalendarProvider, ConnectionStatus, PipelineStatus, Prisma, UserState } from "@prisma/client";
+import {
+  CalendarEventStatus,
+  CalendarProvider,
+  ConnectionStatus,
+  PipelineStatus,
+  Prisma,
+  UserState
+} from "@prisma/client";
 import type { Bot, Context } from "grammy";
 import { InputFile } from "grammy";
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { DateTime } from "luxon";
+import { createICloudEventFromDraft, type ICloudCredentials } from "@/lib/calendar/icloud";
 import { env, requireEnv } from "@/lib/config/env";
 import { prisma } from "@/lib/db/prisma";
-import { createICloudEventFromDraft } from "@/lib/calendar/icloud";
-import type { ICloudCredentials } from "@/lib/calendar/icloud";
 import { getEventParser } from "@/lib/parser";
 import { buildIcs, buildIcsFilename } from "@/lib/services/ics";
+import { getTranscriber } from "@/lib/transcriber";
 import { parseAction, buildDraftKeyboard } from "@/lib/telegram/keyboards";
 import { renderDraftMessage } from "@/lib/telegram/messages";
-import { getTranscriber } from "@/lib/transcriber";
+import { consumeUserRateLimit } from "@/lib/telegram/rate-limit";
 import type { EventDraft } from "@/lib/types/event";
+import { logError, logInfo } from "@/lib/utils/log";
 
 const BOT_TOKEN = () => requireEnv("TELEGRAM_BOT_TOKEN");
-const DEFAULT_TIMEZONE = "Europe/Moscow";
+const DEFAULT_TIMEZONE = "Europe/Warsaw";
 const DEFAULT_REMINDER_MINUTES = 30;
 const UPCOMING_LIMIT = 10;
 const PERSONAL_ICAL_PROVIDER = CalendarProvider.icloud;
@@ -52,7 +60,7 @@ export function registerHandlers(bot: Bot<Context>): void {
 
     const check = DateTime.now().setZone(nextTimezone);
     if (!check.isValid) {
-      await ctx.reply("Некорректная таймзона. Пример: Europe/Moscow");
+      await ctx.reply("Некорректная таймзона. Пример: Europe/Warsaw");
       return;
     }
 
@@ -178,11 +186,15 @@ export function registerHandlers(bot: Bot<Context>): void {
         provider: PERSONAL_ICAL_PROVIDER,
         appleId,
         encryptedAppPassword,
+        encryptedSecret: encryptedAppPassword,
+        isActive: true,
         status: ConnectionStatus.connected
       },
       update: {
         appleId,
         encryptedAppPassword,
+        encryptedSecret: encryptedAppPassword,
+        isActive: true,
         status: ConnectionStatus.connected
       }
     });
@@ -203,11 +215,14 @@ export function registerHandlers(bot: Bot<Context>): void {
       create: {
         userId: user.id,
         provider: PERSONAL_ICAL_PROVIDER,
+        isActive: false,
         status: ConnectionStatus.disconnected
       },
       update: {
         appleId: null,
         encryptedAppPassword: null,
+        encryptedSecret: null,
+        isActive: false,
         status: ConnectionStatus.disconnected
       }
     });
@@ -225,10 +240,10 @@ export function registerHandlers(bot: Bot<Context>): void {
       return;
     }
 
-    console.info("telegram feedback", {
+    logInfo("telegram feedback", {
       userId: user.id,
       telegramUserId: user.telegramUserId,
-      feedback: feedback.slice(0, 1000)
+      feedbackLength: feedback.length
     });
 
     await ctx.reply("Спасибо! Отзыв сохранен.");
@@ -244,6 +259,12 @@ export function registerHandlers(bot: Bot<Context>): void {
     }
 
     const user = await ensureUser(ctx);
+    const rate = consumeUserRateLimit(user.id);
+    if (!rate.ok) {
+      await ctx.reply(`Слишком много сообщений. Повторите через ${rate.retryAfterSeconds} сек.`);
+      return;
+    }
+
     const telegramChatId = String(chatId);
     const telegramMessageId = ctx.message.message_id;
 
@@ -268,7 +289,8 @@ export function registerHandlers(bot: Bot<Context>): void {
         telegramMessageId,
         telegramUpdateId: ctx.update.update_id,
         voiceFileId: voice.file_id,
-        status: PipelineStatus.received
+        status: PipelineStatus.received,
+        itemType: "event"
       }
     });
 
@@ -295,7 +317,9 @@ export function registerHandlers(bot: Bot<Context>): void {
         where: { id: dbMessage.id },
         data: {
           transcript,
-          status: PipelineStatus.transcribed
+          rawText: transcript,
+          status: PipelineStatus.transcribed,
+          itemType: "event"
         }
       });
 
@@ -309,7 +333,13 @@ export function registerHandlers(bot: Bot<Context>): void {
         await prisma.$transaction([
           prisma.message.update({
             where: { id: dbMessage.id },
-            data: { status: PipelineStatus.parsed }
+            data: {
+              status: PipelineStatus.parsed,
+              parsedJson: {
+                question: parseResult.question ?? "Нужно уточнение по событию.",
+                clarificationsAsked: 1
+              }
+            }
           }),
           prisma.user.update({
             where: { id: user.id },
@@ -320,9 +350,7 @@ export function registerHandlers(bot: Bot<Context>): void {
           })
         ]);
 
-        await ctx.reply(
-          `${parseResult.question ?? "Нужно уточнение по событию."}\nОтветьте одной строкой.`
-        );
+        await ctx.reply(`${parseResult.question ?? "Нужно уточнение по событию."}\nОтветьте одной строкой.`);
         return;
       }
 
@@ -332,7 +360,9 @@ export function registerHandlers(bot: Bot<Context>): void {
         where: { id: dbMessage.id },
         data: {
           status: PipelineStatus.awaiting_confirmation,
-          draftJson: toJsonDraft(draft)
+          draftJson: toJsonDraft(draft),
+          parsedJson: Prisma.DbNull,
+          itemType: "event"
         }
       });
 
@@ -349,7 +379,7 @@ export function registerHandlers(bot: Bot<Context>): void {
       });
 
       await ctx.reply("Не удалось обработать голосовое. Попробуйте еще раз.");
-      console.error("voice pipeline failed", {
+      logError("voice pipeline failed", {
         messageId: dbMessage.id,
         reason: toSafeError(error)
       });
@@ -412,7 +442,6 @@ export function registerHandlers(bot: Bot<Context>): void {
       return;
     }
 
-    // create action
     if (message.status === PipelineStatus.created) {
       await ctx.answerCallbackQuery({ text: "Событие уже создано" });
       return;
@@ -456,6 +485,30 @@ export function registerHandlers(bot: Bot<Context>): void {
           }
         });
 
+        await tx.calendarEvent.upsert({
+          where: { uid },
+          create: {
+            userId: user.id,
+            inboxItemId: message.id,
+            uid,
+            title: draft.title,
+            location: draft.location,
+            startAt: new Date(draft.start),
+            endAt: new Date(draft.end),
+            status: CalendarEventStatus.created,
+            providerMeta: {
+              timezone: draft.timezone
+            }
+          },
+          update: {
+            title: draft.title,
+            location: draft.location,
+            startAt: new Date(draft.start),
+            endAt: new Date(draft.end),
+            status: CalendarEventStatus.created
+          }
+        });
+
         await tx.message.update({
           where: { id: message.id },
           data: { status: PipelineStatus.created }
@@ -474,7 +527,7 @@ export function registerHandlers(bot: Bot<Context>): void {
     } catch (error) {
       if (!(error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002")) {
         await ctx.answerCallbackQuery({ text: "Ошибка создания" });
-        console.error("event creation failed", { messageId: message.id, reason: toSafeError(error) });
+        logError("event creation failed", { messageId: message.id, reason: toSafeError(error) });
         return;
       }
     }
@@ -486,18 +539,44 @@ export function registerHandlers(bot: Bot<Context>): void {
 
     if (iCloudConfig) {
       try {
-        await createICloudEventFromDraft({
+        const syncResult = await createICloudEventFromDraft({
           uid,
           draft,
           calendarName: env.ICLOUD_CALENDAR_NAME || undefined,
           credentials: iCloudConfig.credentials
         });
+
         syncedToICloud = true;
+        await prisma.calendarEvent.updateMany({
+          where: { uid },
+          data: {
+            status: CalendarEventStatus.synced,
+            createdInIcloud: true,
+            providerMeta: {
+              source: iCloudConfig.source,
+              eventUrl: syncResult.eventUrl,
+              calendarUrl: syncResult.calendarUrl,
+              principalUrl: syncResult.principalUrl,
+              etag: syncResult.etag ?? null
+            }
+          }
+        });
       } catch (error) {
         iCloudSyncError = toSafeError(error);
-        console.error("icloud sync failed", {
+        logError("icloud sync failed", {
           messageId: message.id,
           reason: iCloudSyncError
+        });
+
+        await prisma.calendarEvent.updateMany({
+          where: { uid },
+          data: {
+            status: CalendarEventStatus.failed,
+            createdInIcloud: false,
+            providerMeta: {
+              syncError: iCloudSyncError
+            }
+          }
         });
       }
     }
@@ -519,7 +598,7 @@ export function registerHandlers(bot: Bot<Context>): void {
     const fileName = buildIcsFilename(draft.start, "event");
 
     await ctx.api.sendDocument(
-      ctx.callbackQuery.message?.chat.id ?? ctx.from.id,
+      ctx.callbackQuery?.message?.chat.id ?? ctx.from.id,
       new InputFile(Buffer.from(ics, "utf-8"), fileName),
       {
         caption: hasICloudConfig
@@ -543,6 +622,11 @@ export function registerHandlers(bot: Bot<Context>): void {
     }
 
     const user = await ensureUser(ctx);
+    const rate = consumeUserRateLimit(user.id);
+    if (!rate.ok) {
+      await ctx.reply(`Слишком много сообщений. Повторите через ${rate.retryAfterSeconds} сек.`);
+      return;
+    }
 
     if (user.state !== UserState.awaiting_edit || !user.currentDraftMessageId) {
       await ctx.reply("Отправьте голосовое сообщение для создания события.");
@@ -578,17 +662,46 @@ export function registerHandlers(bot: Bot<Context>): void {
     });
 
     if (!parseResult.draft) {
+      const clarificationsAsked = getClarificationsAsked(message.parsedJson);
+
+      if (clarificationsAsked >= 1) {
+        await prisma.$transaction([
+          prisma.message.update({
+            where: { id: message.id },
+            data: {
+              status: PipelineStatus.cancelled,
+              parsedJson: {
+                question: parseResult.question ?? "Недостаточно данных для события"
+              }
+            }
+          }),
+          prisma.user.update({
+            where: { id: user.id },
+            data: {
+              state: UserState.idle,
+              currentDraftMessageId: null
+            }
+          })
+        ]);
+
+        await ctx.reply("Не удалось уточнить событие. Отправьте новое голосовое с датой и временем.");
+        return;
+      }
+
       await prisma.message.update({
         where: { id: message.id },
         data: {
           transcript: mergedText,
+          rawText: mergedText,
+          parsedJson: {
+            question: parseResult.question ?? "Нужно уточнение",
+            clarificationsAsked: clarificationsAsked + 1
+          },
           status: PipelineStatus.parsed
         }
       });
 
-      await ctx.reply(
-        `${parseResult.question ?? "Нужно уточнение."}\nОтветьте одной строкой.`
-      );
+      await ctx.reply(`${parseResult.question ?? "Нужно уточнение."}\nОтветьте одной строкой.`);
       return;
     }
 
@@ -599,8 +712,10 @@ export function registerHandlers(bot: Bot<Context>): void {
         where: { id: message.id },
         data: {
           transcript: mergedText,
+          rawText: mergedText,
           draftJson: toJsonDraft(draft),
-          status: PipelineStatus.awaiting_confirmation
+          status: PipelineStatus.awaiting_confirmation,
+          itemType: "event"
         }
       }),
       prisma.user.update({
@@ -656,6 +771,19 @@ async function downloadTelegramFile(filePath: string): Promise<Buffer> {
 
   const arrayBuffer = await response.arrayBuffer();
   return Buffer.from(arrayBuffer);
+}
+
+function getClarificationsAsked(value: Prisma.JsonValue | null): number {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return 0;
+  }
+
+  const raw = (value as Record<string, unknown>).clarificationsAsked;
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0) {
+    return 0;
+  }
+
+  return Math.trunc(raw);
 }
 
 function toSafeError(error: unknown): string {
@@ -917,7 +1045,7 @@ async function resolveICloudConfig(
         }
       };
     } catch (error) {
-      console.error("icloud credentials decrypt failed", {
+      logError("icloud credentials decrypt failed", {
         userId,
         reason: toSafeError(error)
       });
