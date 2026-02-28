@@ -38,7 +38,8 @@ model User {
   telegramUsername      String?
   firstName             String?
   lastName              String?
-  timezone              String               @default("Europe/Warsaw")
+  timezone              String               @default("Europe/Moscow")
+  defaultReminderMinutes Int?               @default(30)
   languageCode          String?              @default("ru")
   state                 UserState            @default(idle)
   currentDraftMessageId String?
