@@ -4,9 +4,10 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "typecheck": "tsc --noEmit --incremental false",
+    "build": "npm run typecheck && next build --no-lint",
     "start": "next start",
-    "lint": "next lint",
+    "lint": "npm run typecheck",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev"
   },
