@@ -4,6 +4,7 @@ import { InputFile } from "grammy";
 import { DateTime } from "luxon";
 import { env, requireEnv } from "@/lib/config/env";
 import { prisma } from "@/lib/db/prisma";
+import { createICloudEventFromDraft } from "@/lib/calendar/icloud";
 import { getEventParser } from "@/lib/parser";
 import { buildIcs, buildIcsFilename } from "@/lib/services/ics";
 import { parseAction, buildDraftKeyboard } from "@/lib/telegram/keyboards";
@@ -288,14 +289,55 @@ export function registerHandlers(bot: Bot<Context>): void {
       }
     }
 
+    const hasICloudConfig = Boolean(env.ICLOUD_APPLE_ID && env.ICLOUD_APP_SPECIFIC_PASSWORD);
+    let syncedToICloud = false;
+    let iCloudSyncError: string | null = null;
+
+    if (hasICloudConfig) {
+      try {
+        await createICloudEventFromDraft({
+          uid,
+          draft,
+          calendarName: env.ICLOUD_CALENDAR_NAME || undefined,
+          credentials: {
+            appleId: env.ICLOUD_APPLE_ID,
+            appSpecificPassword: env.ICLOUD_APP_SPECIFIC_PASSWORD,
+            baseUrl: env.ICLOUD_CALDAV_BASE_URL
+          }
+        });
+        syncedToICloud = true;
+      } catch (error) {
+        iCloudSyncError = toSafeError(error);
+        console.error("icloud sync failed", {
+          messageId: message.id,
+          reason: iCloudSyncError
+        });
+      }
+    }
+
+    if (syncedToICloud) {
+      await ctx.answerCallbackQuery({ text: "Событие добавлено в iCloud" });
+      await safeRemoveInlineKeyboard(ctx);
+      await ctx.reply("Событие создано и автоматически добавлено в iCloud Calendar.");
+      return;
+    }
+
     const ics = buildIcs({ uid, draft });
     const fileName = buildIcsFilename(draft.start, "event");
 
-    await ctx.api.sendDocument(ctx.callbackQuery.message?.chat.id ?? ctx.from.id, new InputFile(Buffer.from(ics, "utf-8"), fileName), {
-      caption: "Готово. Откройте файл, чтобы добавить событие в Apple Calendar."
-    });
+    await ctx.api.sendDocument(
+      ctx.callbackQuery.message?.chat.id ?? ctx.from.id,
+      new InputFile(Buffer.from(ics, "utf-8"), fileName),
+      {
+        caption: hasICloudConfig
+          ? "Событие создано. Не удалось добавить в iCloud автоматически, отправляю .ics как запасной вариант."
+          : "Событие создано. Подключите iCloud в .env, чтобы добавлять автоматически."
+      }
+    );
 
-    await ctx.answerCallbackQuery({ text: "Событие создано" });
+    await ctx.answerCallbackQuery({
+      text: hasICloudConfig && iCloudSyncError ? "iCloud недоступен, отправлен .ics" : "Событие создано"
+    });
     await safeRemoveInlineKeyboard(ctx);
   });
 

@@ -1,8 +1,12 @@
 import { NextResponse } from "next/server";
 import { env } from "@/lib/config/env";
-import { getTelegramBot } from "@/lib/telegram/bot";
+import { getInitializedTelegramBot } from "@/lib/telegram/bot";
 
 export const runtime = "nodejs";
+
+export async function GET() {
+  return NextResponse.json({ ok: true, endpoint: "telegram_webhook" });
+}
 
 export async function POST(request: Request) {
   if (env.TELEGRAM_WEBHOOK_SECRET) {
@@ -21,7 +25,7 @@ export async function POST(request: Request) {
   }
 
   try {
-    const bot = getTelegramBot();
+    const bot = await getInitializedTelegramBot();
     await bot.handleUpdate(update as never);
     return NextResponse.json({ ok: true });
   } catch (error) {
