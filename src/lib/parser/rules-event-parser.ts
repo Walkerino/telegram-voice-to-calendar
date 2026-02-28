@@ -9,6 +9,51 @@ type ParsedDate = {
   type: "today" | "tomorrow" | "weekday";
 };
 
+const WORD_CHAR_CLASS = "\\p{L}\\p{N}_";
+
+const NUMBER_WORDS: Record<string, number> = {
+  ноль: 0,
+  один: 1,
+  одна: 1,
+  одну: 1,
+  два: 2,
+  две: 2,
+  три: 3,
+  четыре: 4,
+  пять: 5,
+  шесть: 6,
+  семь: 7,
+  восемь: 8,
+  девять: 9,
+  десять: 10,
+  одиннадцать: 11,
+  двенадцать: 12,
+  тринадцать: 13,
+  четырнадцать: 14,
+  пятнадцать: 15,
+  шестнадцать: 16,
+  семнадцать: 17,
+  восемнадцать: 18,
+  девятнадцать: 19,
+  двадцать: 20,
+  тридцать: 30,
+  сорок: 40,
+  fifty: 50,
+  sixty: 60,
+  one: 1,
+  two: 2,
+  three: 3,
+  four: 4,
+  five: 5,
+  six: 6,
+  seven: 7,
+  eight: 8,
+  nine: 9,
+  ten: 10,
+  eleven: 11,
+  twelve: 12
+};
+
 const WEEKDAY_FORMS: Array<{ weekday: number; forms: string[] }> = [
   { weekday: 1, forms: ["понедельник", "понедельнику", "monday", "mon"] },
   { weekday: 2, forms: ["вторник", "вторнику", "tuesday", "tue"] },
@@ -80,52 +125,84 @@ export class RulesEventParser implements IEventParser {
 }
 
 function parseRelativeStart(text: string, now: DateTime): DateTime | null {
-  const hoursMatch = text.match(/(?:через|in)\s+(\d{1,2})\s*(?:час|часа|часов|hour|hours)\b/u);
+  const hoursMatch = text.match(
+    new RegExp(
+      `(?:^|[^${WORD_CHAR_CLASS}])(?:через|in)\\s+([\\p{L}\\p{N}-]+)\\s*(?:час(?:а|ов)?|hour|hours)(?=$|[^${WORD_CHAR_CLASS}])`,
+      "u"
+    )
+  );
   if (hoursMatch) {
-    const hours = Number(hoursMatch[1]);
-    return now.plus({ hours }).startOf("minute");
+    const hours = parseNumberToken(hoursMatch[1]);
+    if (hours !== null && hours > 0) {
+      return now.plus({ hours }).startOf("minute");
+    }
   }
 
-  const minutesMatch = text.match(/(?:через|in)\s+(\d{1,3})\s*(?:минут|минута|минуты|min|minute|minutes)\b/u);
+  const minutesMatch = text.match(
+    new RegExp(
+      `(?:^|[^${WORD_CHAR_CLASS}])(?:через|in)\\s+([\\p{L}\\p{N}-]+)\\s*(?:минут(?:а|ы)?|мин|minute|minutes|min)(?=$|[^${WORD_CHAR_CLASS}])`,
+      "u"
+    )
+  );
   if (minutesMatch) {
-    const minutes = Number(minutesMatch[1]);
-    return now.plus({ minutes }).startOf("minute");
+    const minutes = parseNumberToken(minutesMatch[1]);
+    if (minutes !== null && minutes > 0) {
+      return now.plus({ minutes }).startOf("minute");
+    }
   }
 
   return null;
 }
 
 function parseDuration(text: string): number | null {
-  const hourMatch = text.match(/(?:на|for)\s+(\d{1,2})\s*(?:час|часа|часов|h|hour|hours)\b/u);
+  const hourMatch = text.match(
+    new RegExp(
+      `(?:^|[^${WORD_CHAR_CLASS}])(?:на|for)\\s+([\\p{L}\\p{N}-]+)\\s*(?:час(?:а|ов)?|h|hour|hours)(?=$|[^${WORD_CHAR_CLASS}])`,
+      "u"
+    )
+  );
   if (hourMatch) {
-    return Number(hourMatch[1]) * 60;
+    const hours = parseNumberToken(hourMatch[1]);
+    if (hours !== null && hours > 0) {
+      return hours * 60;
+    }
   }
 
-  const oneHourMatch = text.match(/(?:на|for)\s*(?:час|an hour|one hour)\b/u);
+  const oneHourMatch = text.match(
+    new RegExp(`(?:^|[^${WORD_CHAR_CLASS}])(?:на|for)\\s*(?:час|an\\s+hour|one\\s+hour)(?=$|[^${WORD_CHAR_CLASS}])`, "u")
+  );
   if (oneHourMatch) {
     return 60;
   }
 
-  const minMatch = text.match(/(?:на|for)\s+(\d{1,3})\s*(?:минут|минута|минуты|min|minute|minutes)\b/u);
+  const minMatch = text.match(
+    new RegExp(
+      `(?:^|[^${WORD_CHAR_CLASS}])(?:на|for)\\s+([\\p{L}\\p{N}-]+)\\s*(?:минут(?:а|ы)?|мин|minute|minutes|min)(?=$|[^${WORD_CHAR_CLASS}])`,
+      "u"
+    )
+  );
   if (minMatch) {
-    return Number(minMatch[1]);
+    const minutes = parseNumberToken(minMatch[1]);
+    if (minutes !== null && minutes > 0) {
+      return minutes;
+    }
   }
 
   return null;
 }
 
 function parseDate(text: string, now: DateTime): ParsedDate | null {
-  if (/\b(сегодня|today)\b/u.test(text)) {
+  if (containsWord(text, "сегодня") || containsWord(text, "today")) {
     return { date: now.startOf("day"), type: "today" };
   }
 
-  if (/\b(завтра|tomorrow)\b/u.test(text)) {
+  if (containsWord(text, "завтра") || containsWord(text, "tomorrow")) {
     return { date: now.plus({ days: 1 }).startOf("day"), type: "tomorrow" };
   }
 
   for (const item of WEEKDAY_FORMS) {
     for (const form of item.forms) {
-      const pattern = new RegExp(`\\b${escapeRegex(form)}\\b`, "u");
+      const pattern = wordPattern(form);
       if (pattern.test(text)) {
         const delta = (item.weekday - now.weekday + 7) % 7;
         const days = delta === 0 ? 7 : delta;
@@ -141,7 +218,14 @@ function parseDate(text: string, now: DateTime): ParsedDate | null {
 }
 
 function parseTime(text: string): ParsedTime | null {
-  const match = text.match(/(?:\bв\b|\bat\b)\s*(\d{1,2})(?::(\d{2}))?/u);
+  const withPrefix = text.match(
+    new RegExp(
+      `(?:^|[^${WORD_CHAR_CLASS}])(?:в|at)\\s*(\\d{1,2})(?::(\\d{2}))?(?=$|[^\\d])`,
+      "u"
+    )
+  );
+  const withoutPrefix = text.match(/(?:^|[^\d])(\d{1,2})[:.](\d{2})(?=$|[^\d])/u);
+  const match = withPrefix ?? withoutPrefix;
   if (!match) {
     return null;
   }
@@ -175,12 +259,15 @@ function applyDateAndTime(parsedDate: ParsedDate, parsedTime: ParsedTime, now: D
 function extractTitle(source: string): string {
   let title = source;
 
+  const numberWordPattern = "(?:\\d+|один|одна|одну|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять|one|two|three|four|five|six|seven|eight|nine|ten)";
+
   const cleanupPatterns = [
     /(?:сегодня|завтра|today|tomorrow)/giu,
-    /(?:через|in)\s+\d+\s*(?:час|часа|часов|hour|hours|минут|минута|минуты|min|minute|minutes)/giu,
+    new RegExp(`(?:через|in)\\s+${numberWordPattern}\\s*(?:час(?:а|ов)?|hour|hours|минут(?:а|ы)?|мин|min|minute|minutes)`, "giu"),
     /(?:в|at)\s*\d{1,2}(?::\d{2})?/giu,
+    /\d{1,2}[:.]\d{2}/g,
     /(?:в\s+)?(?:понедельник|вторник|среда|среду|четверг|пятница|пятницу|суббота|субботу|воскресенье|monday|tuesday|wednesday|thursday|friday|saturday|sunday)/giu,
-    /(?:на|for)\s+\d+\s*(?:час|часа|часов|h|hour|hours|минут|минута|минуты|min|minute|minutes)/giu,
+    new RegExp(`(?:на|for)\\s+${numberWordPattern}\\s*(?:час(?:а|ов)?|h|hour|hours|минут(?:а|ы)?|мин|min|minute|minutes)`, "giu"),
     /(?:на|for)\s*(?:час|an hour|one hour)/giu
   ];
 
@@ -200,4 +287,26 @@ function extractTitle(source: string): string {
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function wordPattern(word: string): RegExp {
+  return new RegExp(`(?:^|[^${WORD_CHAR_CLASS}])${escapeRegex(word)}(?=$|[^${WORD_CHAR_CLASS}])`, "u");
+}
+
+function containsWord(text: string, word: string): boolean {
+  return wordPattern(word).test(text);
+}
+
+function parseNumberToken(raw: string): number | null {
+  const token = raw.toLowerCase().trim();
+  if (!token) {
+    return null;
+  }
+
+  if (/^\d+$/.test(token)) {
+    const value = Number(token);
+    return Number.isFinite(value) ? value : null;
+  }
+
+  return NUMBER_WORDS[token] ?? null;
 }

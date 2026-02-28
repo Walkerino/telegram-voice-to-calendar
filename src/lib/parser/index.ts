@@ -1,6 +1,5 @@
 import { env } from "@/lib/config/env";
 import type { IEventParser } from "./IEventParser";
-import { LlmEventParser } from "./llm-event-parser";
 import { RulesEventParser } from "./rules-event-parser";
 
 let parserSingleton: IEventParser | undefined;
@@ -11,8 +10,7 @@ export function getEventParser(): IEventParser {
   }
 
   if (env.EVENT_PARSER === "llm") {
-    parserSingleton = new LlmEventParser();
-    return parserSingleton;
+    console.warn("EVENT_PARSER=llm is not implemented in MVP. Falling back to rules parser.");
   }
 
   parserSingleton = new RulesEventParser();
