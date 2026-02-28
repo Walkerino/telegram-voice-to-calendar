@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { env } from "@/lib/config/env";
 import { getInitializedTelegramBot } from "@/lib/telegram/bot";
+import { logError } from "@/lib/utils/log";
 
 export const runtime = "nodejs";
 
@@ -29,7 +30,7 @@ export async function POST(request: Request) {
     await bot.handleUpdate(update as never);
     return NextResponse.json({ ok: true });
   } catch (error) {
-    console.error("telegram webhook failed", {
+    logError("telegram webhook failed", {
       reason: error instanceof Error ? error.message : "unknown"
     });
 

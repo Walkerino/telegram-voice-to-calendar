@@ -43,6 +43,7 @@ export type ICloudCreateEventResult = {
   principalUrl: string;
   calendarUrl: string;
   eventUrl: string;
+  etag?: string;
 };
 
 export interface ICloudCalendarClient {
@@ -57,7 +58,7 @@ export interface ICloudCalendarClient {
     calendarUrl: string;
     uid: string;
     ics: string;
-  }): Promise<string>;
+  }): Promise<{ eventUrl: string; etag?: string }>;
 }
 
 export class CalDavICloudClient implements ICloudCalendarClient {
@@ -128,7 +129,7 @@ export class CalDavICloudClient implements ICloudCalendarClient {
     calendarUrl: string;
     uid: string;
     ics: string;
-  }): Promise<string> {
+  }): Promise<{ eventUrl: string; etag?: string }> {
     const calendarUrl = ensureTrailingSlash(options.calendarUrl);
     const eventUrl = `${calendarUrl}${encodeURIComponent(options.uid)}.ics`;
 
@@ -146,7 +147,10 @@ export class CalDavICloudClient implements ICloudCalendarClient {
       throw new Error(`iCloud CalDAV PUT failed: ${response.status} ${response.statusText} ${details}`);
     }
 
-    return eventUrl;
+    return {
+      eventUrl,
+      etag: response.headers.get("etag") ?? undefined
+    };
   }
 }
 
@@ -159,14 +163,14 @@ export async function createICloudEventFromDraft(options: ICloudCreateEventOptio
     calendarName: options.calendarName
   });
   const ics = buildIcs({ uid: options.uid, draft: options.draft });
-  const eventUrl = await client.createEventIcs({
+  const created = await client.createEventIcs({
     credentials: options.credentials,
     calendarUrl,
     uid: options.uid,
     ics
   });
 
-  return { principalUrl, calendarUrl, eventUrl };
+  return { principalUrl, calendarUrl, eventUrl: created.eventUrl, etag: created.etag };
 }
 
 function normalizeBaseUrl(baseUrl?: string): string {

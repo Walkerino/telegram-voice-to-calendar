@@ -2,10 +2,10 @@ import { InlineKeyboard } from "grammy";
 
 export function buildDraftKeyboard(messageId: string): InlineKeyboard {
   return new InlineKeyboard()
-    .text("✅ Создать", `create:${messageId}`)
-    .text("✏️ Изменить", `edit:${messageId}`)
+    .text("✅ Save / Create", `create:${messageId}`)
+    .text("✏️ Edit", `edit:${messageId}`)
     .row()
-    .text("🗑 Отмена", `cancel:${messageId}`);
+    .text("🗑 Cancel", `cancel:${messageId}`);
 }
 
 export function parseAction(data: string): { action: "create" | "edit" | "cancel"; messageId: string } | null {
