@@ -71,7 +71,7 @@ export class RulesEventParser implements IEventParser {
       return { question: "Не понял текст. Напишите событие одной строкой." };
     }
 
-    const timezone = input.timezone || "Europe/Warsaw";
+    const timezone = input.timezone || "Europe/Moscow";
     const now = DateTime.fromJSDate(input.now ?? new Date(), { zone: timezone });
     const lower = source.toLowerCase();
 
@@ -117,7 +117,7 @@ export class RulesEventParser implements IEventParser {
         start: start.toUTC().toISO() as string,
         end: end.toUTC().toISO() as string,
         timezone,
-        reminders: [{ minutesBefore: 10 }],
+        reminders: [{ minutesBefore: 30 }],
         confidence: hasDate && hasTime ? 0.9 : 0.6
       }
     };

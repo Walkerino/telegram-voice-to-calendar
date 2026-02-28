@@ -27,7 +27,9 @@ export function buildIcs(options: {
   for (const reminder of draft.reminders) {
     event.createAlarm({
       type: ICalAlarmType.display,
-      trigger: -Math.abs(reminder.minutesBefore) * 60,
+      // ical-generator `trigger` can produce RELATED=END; `triggerBefore`
+      // reliably generates alarm before event start.
+      triggerBefore: Math.abs(reminder.minutesBefore) * 60,
       description: "Reminder"
     });
   }
