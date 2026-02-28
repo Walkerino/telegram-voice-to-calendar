@@ -1,0 +1,14 @@
+node_modules
+.next
+.env
+.env.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+coverage
+prisma/dev.db
+prisma/dev.db-journal
+.tools
+.next.bak.*/
+*.tsbuildinfo
