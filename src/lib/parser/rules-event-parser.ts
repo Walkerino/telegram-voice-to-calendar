@@ -3,6 +3,8 @@ import type { ParseResult } from "@/lib/types/event";
 import type { IEventParser, ParseInput } from "./IEventParser";
 
 type ParsedTime = { hour: number; minute: number };
+type DayPart = "morning" | "afternoon" | "evening" | "night" | "am" | "pm";
+type ParsedTimeRange = { start: ParsedTime; end: ParsedTime };
 
 type ParsedDate = {
   date: DateTime;
@@ -64,6 +66,76 @@ const WEEKDAY_FORMS: Array<{ weekday: number; forms: string[] }> = [
   { weekday: 7, forms: ["воскресенье", "воскресенье", "sunday", "sun"] }
 ];
 
+const DAY_PART_ALIASES: Array<{ part: DayPart; form: string }> = [
+  { part: "morning", form: "утра" },
+  { part: "morning", form: "утром" },
+  { part: "morning", form: "утро" },
+  { part: "morning", form: "in the morning" },
+  { part: "morning", form: "morning" },
+  { part: "afternoon", form: "дня" },
+  { part: "afternoon", form: "днем" },
+  { part: "afternoon", form: "днём" },
+  { part: "afternoon", form: "in the afternoon" },
+  { part: "afternoon", form: "afternoon" },
+  { part: "evening", form: "вечера" },
+  { part: "evening", form: "вечером" },
+  { part: "evening", form: "in the evening" },
+  { part: "evening", form: "evening" },
+  { part: "night", form: "ночи" },
+  { part: "night", form: "ночью" },
+  { part: "night", form: "at night" },
+  { part: "night", form: "night" },
+  { part: "am", form: "am" },
+  { part: "pm", form: "pm" }
+];
+
+const DAY_PART_PATTERN = DAY_PART_ALIASES.map((item) => escapeRegex(item.form))
+  .sort((left, right) => right.length - left.length)
+  .join("|");
+
+const WORD_CHAR_RE = /[\p{L}\p{N}_]/u;
+const TITLE_TOKEN_EDGE_RE = /^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu;
+
+const TITLE_STOP_WORDS = new Set([
+  "сегодня",
+  "завтра",
+  "послезавтра",
+  "today",
+  "tomorrow",
+  "утро",
+  "утром",
+  "утра",
+  "день",
+  "днем",
+  "днём",
+  "дня",
+  "вечер",
+  "вечером",
+  "вечера",
+  "ночь",
+  "ночью",
+  "ночи",
+  "morning",
+  "afternoon",
+  "evening",
+  "night",
+  "am",
+  "pm",
+  "час",
+  "часа",
+  "часов",
+  "minute",
+  "minutes",
+  "hour",
+  "hours",
+  "минута",
+  "минуты",
+  "минут",
+  "мин",
+  "h",
+  "min"
+]);
+
 export class RulesEventParser implements IEventParser {
   async parse(input: ParseInput): Promise<ParseResult> {
     const source = input.text.trim();
@@ -79,19 +151,22 @@ export class RulesEventParser implements IEventParser {
     const durationMinutes = parseDuration(lower) ?? 60;
 
     let start: DateTime | null = null;
+    let end: DateTime | null = null;
     let hasDate = false;
     let hasTime = false;
 
     if (relativeStart) {
       start = relativeStart;
+      end = start.plus({ minutes: durationMinutes });
       hasDate = true;
       hasTime = true;
     } else {
       const parsedDate = parseDate(lower, now);
-      const parsedTime = parseTime(lower);
+      const parsedTimeRange = parseTimeRange(lower);
+      const parsedTime = parsedTimeRange?.start ?? parseTime(lower);
 
       hasDate = Boolean(parsedDate);
-      hasTime = Boolean(parsedTime);
+      hasTime = Boolean(parsedTimeRange || parsedTime);
 
       if (!hasDate || !hasTime) {
         return {
@@ -102,13 +177,19 @@ export class RulesEventParser implements IEventParser {
       }
 
       start = applyDateAndTime(parsedDate as ParsedDate, parsedTime as ParsedTime, now);
+
+      if (parsedTimeRange) {
+        const rangeEnd = applyDateAndTime(parsedDate as ParsedDate, parsedTimeRange.end, now);
+        end = rangeEnd <= start ? rangeEnd.plus({ days: 1 }) : rangeEnd;
+      } else {
+        end = start.plus({ minutes: durationMinutes });
+      }
     }
 
-    if (!start || !start.isValid) {
+    if (!start || !start.isValid || !end || !end.isValid || end <= start) {
       return { question: "Не удалось распознать дату/время. Напишите событие одной строкой." };
     }
 
-    const end = start.plus({ minutes: durationMinutes });
     const title = extractTitle(source);
 
     return {
@@ -218,26 +299,84 @@ function parseDate(text: string, now: DateTime): ParsedDate | null {
 }
 
 function parseTime(text: string): ParsedTime | null {
-  const withPrefix = text.match(
-    new RegExp(
-      `(?:^|[^${WORD_CHAR_CLASS}])(?:в|at)\\s*(\\d{1,2})(?::(\\d{2}))?(?=$|[^\\d])`,
-      "u"
-    )
-  );
-  const withoutPrefix = text.match(/(?:^|[^\d])(\d{1,2})[:.](\d{2})(?=$|[^\d])/u);
+  const withPrefix = new RegExp(
+    `(?:^|[^${WORD_CHAR_CLASS}])(?:в|at)\\s*(\\d{1,2})(?::(\\d{2}))?(?=$|[^\\d])`,
+    "u"
+  ).exec(text);
+  const withoutPrefix = /(?:^|[^\d])(\d{1,2})[:.](\d{2})(?=$|[^\d])/u.exec(text);
   const match = withPrefix ?? withoutPrefix;
   if (!match) {
     return null;
   }
 
-  const hour = Number(match[1]);
+  const rawHour = Number(match[1]);
   const minute = Number(match[2] ?? "0");
 
-  if (hour > 23 || minute > 59) {
+  if (rawHour > 23 || minute > 59) {
+    return null;
+  }
+
+  const hourToken = match[1] ?? "";
+  const localHourIndex = Math.max(match[0].indexOf(hourToken), 0);
+  const timeStart = (match.index ?? 0) + localHourIndex;
+  const timeEnd = timeStart + hourToken.length + (match[2] ? match[2].length + 1 : 0);
+  const dayPart = detectDayPartNearTime(text, timeStart, timeEnd);
+  const hour = applyDayPart(rawHour, dayPart);
+
+  if (hour === null) {
     return null;
   }
 
   return { hour, minute };
+}
+
+function parseTimeRange(text: string): ParsedTimeRange | null {
+  const clockMatches = [...text.matchAll(/(\d{1,2})[:.](\d{2})/gu)]
+    .map((match) => {
+      if (typeof match.index !== "number") {
+        return null;
+      }
+
+      const hour = Number(match[1]);
+      const minute = Number(match[2]);
+      if (hour > 23 || minute > 59) {
+        return null;
+      }
+
+      const token = match[0] ?? "";
+      const start = match.index;
+      const end = start + token.length;
+      return { hour, minute, start, end };
+    })
+    .filter((item): item is { hour: number; minute: number; start: number; end: number } => Boolean(item));
+
+  if (clockMatches.length < 2) {
+    return null;
+  }
+
+  for (let index = 0; index < clockMatches.length - 1; index += 1) {
+    const left = clockMatches[index];
+    const right = clockMatches[index + 1];
+    const separator = text.slice(left.end, right.start);
+    if (!/(?:до|to|[-–—])/iu.test(separator)) {
+      continue;
+    }
+
+    const startDayPart = detectDayPartNearTime(text, left.start, left.end);
+    const endDayPart = detectDayPartNearTime(text, right.start, right.end);
+    const startHour = applyDayPart(left.hour, startDayPart);
+    const endHour = applyDayPart(right.hour, endDayPart);
+    if (startHour === null || endHour === null) {
+      continue;
+    }
+
+    return {
+      start: { hour: startHour, minute: left.minute },
+      end: { hour: endHour, minute: right.minute }
+    };
+  }
+
+  return null;
 }
 
 function applyDateAndTime(parsedDate: ParsedDate, parsedTime: ParsedTime, now: DateTime): DateTime {
@@ -263,9 +402,12 @@ function extractTitle(source: string): string {
 
   const cleanupPatterns = [
     /(?:сегодня|завтра|today|tomorrow)/giu,
+    /(?:с|from)?\s*\d{1,2}(?::\d{2})?\s*(?:до|to|[-–—])\s*\d{1,2}(?::\d{2})?/giu,
     new RegExp(`(?:через|in)\\s+${numberWordPattern}\\s*(?:час(?:а|ов)?|hour|hours|минут(?:а|ы)?|мин|min|minute|minutes)`, "giu"),
     /(?:в|at)\s*\d{1,2}(?::\d{2})?/giu,
     /\d{1,2}[:.]\d{2}/g,
+    /(?:^|\s)(?:с|from)\s+(?:до|to)(?=$|\s)/giu,
+    new RegExp(`(?:^|[^${WORD_CHAR_CLASS}])(?:${DAY_PART_PATTERN})(?=$|[^${WORD_CHAR_CLASS}])`, "giu"),
     /(?:в\s+)?(?:понедельник|вторник|среда|среду|четверг|пятница|пятницу|суббота|субботу|воскресенье|monday|tuesday|wednesday|thursday|friday|saturday|sunday)/giu,
     new RegExp(`(?:на|for)\\s+${numberWordPattern}\\s*(?:час(?:а|ов)?|h|hour|hours|минут(?:а|ы)?|мин|min|minute|minutes)`, "giu"),
     /(?:на|for)\s*(?:час|an hour|one hour)/giu
@@ -275,6 +417,7 @@ function extractTitle(source: string): string {
     title = title.replace(pattern, " ");
   }
 
+  title = filterTitleStopWords(title);
   title = title.replace(/\s+/g, " ").trim();
   title = title.replace(/^[,.;:\-\s]+|[,.;:\-\s]+$/g, "");
 
@@ -309,4 +452,96 @@ function parseNumberToken(raw: string): number | null {
   }
 
   return NUMBER_WORDS[token] ?? null;
+}
+
+function detectDayPartNearTime(text: string, timeStart: number, timeEnd: number): DayPart | null {
+  const beforeRaw = text.slice(Math.max(0, timeStart - 40), timeStart).replace(/\s+$/u, "");
+  const afterRaw = text.slice(timeEnd, Math.min(text.length, timeEnd + 40)).replace(/^\s+/u, "");
+
+  const aliases = [...DAY_PART_ALIASES].sort((left, right) => right.form.length - left.form.length);
+  for (const alias of aliases) {
+    if (endsWithWholeWord(beforeRaw, alias.form) || startsWithWholeWord(afterRaw, alias.form)) {
+      return alias.part;
+    }
+  }
+
+  return null;
+}
+
+function applyDayPart(hour: number, dayPart: DayPart | null): number | null {
+  if (!dayPart) {
+    return hour;
+  }
+
+  if ((dayPart === "am" || dayPart === "pm") && hour > 12) {
+    return null;
+  }
+
+  switch (dayPart) {
+    case "am":
+      return hour === 12 ? 0 : hour;
+    case "pm":
+      return hour === 12 ? 12 : hour + 12;
+    case "morning":
+      return hour === 12 ? 0 : hour;
+    case "afternoon":
+      if (hour >= 1 && hour <= 11) {
+        return hour + 12;
+      }
+      return hour;
+    case "evening":
+      if (hour >= 1 && hour <= 11) {
+        return hour + 12;
+      }
+      return hour === 12 ? 0 : hour;
+    case "night":
+      if (hour === 12) {
+        return 0;
+      }
+      if (hour >= 1 && hour <= 5) {
+        return hour;
+      }
+      if (hour >= 6 && hour <= 11) {
+        return hour + 12;
+      }
+      return hour;
+    default:
+      return hour;
+  }
+}
+
+function startsWithWholeWord(text: string, phrase: string): boolean {
+  if (!text.startsWith(phrase)) {
+    return false;
+  }
+  const next = text.charAt(phrase.length);
+  return !isWordChar(next);
+}
+
+function endsWithWholeWord(text: string, phrase: string): boolean {
+  if (!text.endsWith(phrase)) {
+    return false;
+  }
+  const prevIndex = text.length - phrase.length - 1;
+  const prev = prevIndex >= 0 ? text.charAt(prevIndex) : "";
+  return !isWordChar(prev);
+}
+
+function isWordChar(value: string): boolean {
+  return Boolean(value) && WORD_CHAR_RE.test(value);
+}
+
+function filterTitleStopWords(source: string): string {
+  const parts = source.split(/\s+/u);
+  const filtered: string[] = [];
+
+  for (const part of parts) {
+    const normalized = part.toLowerCase().replace(TITLE_TOKEN_EDGE_RE, "");
+    if (!normalized || TITLE_STOP_WORDS.has(normalized)) {
+      continue;
+    }
+    filtered.push(part);
+  }
+
+  return filtered.join(" ");
 }
