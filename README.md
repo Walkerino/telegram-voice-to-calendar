@@ -22,7 +22,8 @@ MVP сервис на Next.js: пользователь отправляет voi
   - `🗑 Cancel`
 - Генерация `.ics` (VEVENT + VALARM) и отправка через `sendDocument`
 - Прямая синхронизация с iCloud Calendar через CalDAV (по env-настройкам)
-- Команды бота: `/help`, `/timezone`, `/reminder`, `/settings`, `/today`, `/upcoming`, `/new`, `/cancel`, `/connect_icloud`, `/disconnect_icloud`, `/feedback`
+- iCloud actions: create, update, delete, fetch events
+- Команды бота: `/help`, `/timezone`, `/reminder`, `/settings`, `/today`, `/upcoming`, `/fetch_events`, `/update_event`, `/delete_event`, `/new`, `/cancel`, `/connect_icloud`, `/disconnect_icloud`, `/feedback`
 
 ## Структура
 
@@ -221,6 +222,9 @@ cloudflared tunnel --url http://localhost:3000
 - `/settings` - показать текущие настройки
 - `/today` - события на сегодня
 - `/upcoming` - ближайшие события
+- `/fetch_events [today|tomorrow|YYYY-MM-DD]` - загрузить события из iCloud
+- `/update_event <UID> | <новый текст события>` - обновить событие в iCloud и локально
+- `/delete_event <UID>` - удалить событие из iCloud и локально
 - `/new` - начать новый сценарий
 - `/cancel` - отменить активный черновик
 - `/connect_icloud your_apple_id@example.com xxxx-xxxx-xxxx-xxxx` - сохранить персональный iCloud
