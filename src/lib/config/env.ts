@@ -45,7 +45,8 @@ export const env = {
   LLM_MAX_TOKENS: process.env.LLM_MAX_TOKENS ?? "900",
   LLM_TEMPERATURE: process.env.LLM_TEMPERATURE ?? "0.2",
   LLM_APP_URL: process.env.LLM_APP_URL ?? "http://localhost:3000",
-  LLM_APP_NAME: process.env.LLM_APP_NAME ?? "telegram-voice-assistant"
+  LLM_APP_NAME: process.env.LLM_APP_NAME ?? "telegram-voice-assistant",
+  MINI_APP_URL: process.env.MINI_APP_URL ?? ""
 };
 
 export function requireEnv(name: keyof typeof env): string {
